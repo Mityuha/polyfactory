@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import typing
 from abc import ABC, abstractmethod
 from collections import Counter, abc, deque
 from contextlib import suppress
@@ -36,6 +35,7 @@ from typing import (
     ClassVar,
     Collection,
     Generic,
+    Iterable,
     Mapping,
     Sequence,
     Type,
@@ -45,7 +45,7 @@ from typing import (
 from uuid import UUID
 
 from faker import Faker
-from typing_extensions import get_args
+from typing_extensions import get_args, get_origin, get_original_bases
 
 from polyfactory.constants import (
     DEFAULT_RANDOM,
@@ -110,7 +110,7 @@ class BaseFactory(ABC, Generic[T]):
     __model__: type[T]
     """
     The model for the factory.
-    This attribute is required for non-base factories and an exception will be raised if its not set.
+    This attribute is required for non-base factories and an exception will be raised if it's not set. Can be automatically inferred from the factory generic argument.
     """
     __check_model__: bool = False
     """
@@ -190,12 +190,13 @@ class BaseFactory(ABC, Generic[T]):
             )
 
         if "__is_base_factory__" not in cls.__dict__ or not cls.__is_base_factory__:
-            model = getattr(cls, "__model__", None)
+            model: type[T] | None = getattr(cls, "__model__", None) or cls._infer_model_type()
             if not model:
                 msg = f"required configuration attribute '__model__' is not set on {cls.__name__}"
                 raise ConfigurationException(
                     msg,
                 )
+            cls.__model__ = model
             if not cls.is_supported_type(model):
                 for factory in BaseFactory._base_factories:
                     if factory.is_supported_type(model):
@@ -218,6 +219,28 @@ class BaseFactory(ABC, Generic[T]):
 
         if cls.__set_as_default_factory_for_type__:
             BaseFactory._factory_type_mapping[cls.__model__] = cls
+
+    @classmethod
+    def _infer_model_type(cls: type[F]) -> type[T] | None:
+        """Return model type inferred from class declaration.
+        class Foo(ModelFactory[MyModel]):  # <<< MyModel
+            ...
+
+        If more than one base class and/or generic arguments specified return None.
+
+        :returns: Inferred model type or None
+        """
+
+        factory_bases: Iterable[type[BaseFactory[T]]] = (
+            b for b in get_original_bases(cls) if get_origin(b) and issubclass(get_origin(b), BaseFactory)
+        )
+        generic_args: Sequence[type[T]] = [
+            arg for factory_base in factory_bases for arg in get_args(factory_base) if not isinstance(arg, TypeVar)
+        ]
+        if len(generic_args) != 1:
+            return None
+
+        return generic_args[0]
 
     @classmethod
     def _get_sync_persistence(cls) -> SyncPersistenceProtocol[T]:
@@ -492,7 +515,7 @@ class BaseFactory(ABC, Generic[T]):
         )
 
     @classmethod
-    def get_constrained_field_value(cls, annotation: Any, field_meta: FieldMeta) -> Any:  # noqa: C901, PLR0911
+    def get_constrained_field_value(cls, annotation: Any, field_meta: FieldMeta) -> Any:  # noqa: C901, PLR0911, PLR0912
         try:
             constraints = cast("Constraints", field_meta.constraints)
             if is_safe_subclass(annotation, float):
@@ -541,8 +564,11 @@ class BaseFactory(ABC, Generic[T]):
                     pattern=constraints.get("pattern"),
                 )
 
-            with suppress(ValueError):
+            try:
                 collection_type = get_collection_type(annotation)
+            except ValueError:
+                collection_type = None
+            if collection_type is not None:
                 if collection_type == dict:
                     return handle_constrained_mapping(
                         factory=cls,
@@ -550,7 +576,6 @@ class BaseFactory(ABC, Generic[T]):
                         min_items=constraints.get("min_length"),
                         max_items=constraints.get("max_length"),
                     )
-
                 return handle_constrained_collection(
                     collection_type=collection_type,  # type: ignore[type-var]
                     factory=cls,
@@ -676,7 +701,7 @@ class BaseFactory(ABC, Generic[T]):
         cls,
         field_meta: FieldMeta,
         field_build_parameters: Any | None = None,
-    ) -> typing.Iterable[Any]:
+    ) -> Iterable[Any]:
         """Return a field value on the subclass if existing, otherwise returns a mock value.
 
         :param field_meta: FieldMeta instance.
